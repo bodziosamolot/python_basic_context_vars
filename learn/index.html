@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ContextVar Field Notes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,700;1,9..144,500&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="meta-line">
+    <span>Field notes</span>
+    <span>python · contextvars</span>
+    <span>for a C# brain</span>
+  </div>
+  <h1>One name,<br><em>many values.</em></h1>
+  <p class="lede">A <code>ContextVar</code> reads like a global, but the answer
+    depends on <em>which task is asking</em>. Seven short notes, each with
+    something to poke at. Every example comes from
+    <code>context_vars_demo.py</code>.</p>
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#race">The bug it fixes</a></li>
+      <li><a href="#inherit">Copy down, never up</a></li>
+      <li><a href="#token">Set, then reset</a></li>
+      <li><a href="#threads">Crossing into threads</a></li>
+      <li><a href="#traps">Three traps</a></li>
+      <li><a href="#dotnet">Coming from C#</a></li>
+      <li><a href="#quiz">Predict the output</a></li>
+    </ol>
+  </nav>
+</header>
+
+<main>
+
+<!-- 01 ─────────────────────────────────────────────── -->
+<section class="note" id="race">
+  <div class="note__num">01</div>
+  <div class="note__body">
+    <h2>The bug it fixes</h2>
+    <p>Three requests run on one thread. Each stores its id, then
+      <code>await</code>s some I/O. While it waits, the event loop runs the
+      others. A module global has <strong>one slot</strong>, so the last writer
+      wins. A <code>ContextVar</code> gives <strong>each task its own
+      slot</strong>.</p>
+
+    <div class="lab" id="race-lab">
+      <div class="lab__bar">
+        <div class="switch" role="radiogroup" aria-label="Where the id is stored">
+          <button type="button" role="radio" aria-checked="true" data-mode="global">module global</button>
+          <button type="button" role="radio" aria-checked="false" data-mode="ctx">ContextVar</button>
+        </div>
+        <div class="controls">
+          <button type="button" data-act="step">Step&nbsp;▸</button>
+          <button type="button" data-act="play">Play</button>
+          <button type="button" data-act="reset">Reset</button>
+        </div>
+      </div>
+      <div class="race">
+        <div class="race__lanes" data-lanes></div>
+        <div class="race__memory" data-memory></div>
+      </div>
+      <p class="lab__caption" data-caption aria-live="polite"></p>
+    </div>
+  </div>
+  <aside class="side">
+    <p><b>Why each task?</b> <code>asyncio.gather()</code> wraps every
+      coroutine in a <code>Task</code>. Each Task runs inside its own copy of
+      the context. That copy is the slot.</p>
+    <p class="analogy">≈ <code>[ThreadStatic]</code> is wrong here: all three
+      share one thread. Think <code>AsyncLocal&lt;T&gt;</code>.</p>
+  </aside>
+</section>
+
+<!-- 02 ─────────────────────────────────────────────── -->
+<section class="note" id="inherit">
+  <div class="note__num">02</div>
+  <div class="note__body">
+    <h2>Copy down, never&nbsp;up</h2>
+    <p>Whether a child's write reaches the parent depends on one thing:
+      <strong>did you start a new Task?</strong> A new Task gets a
+      <em>snapshot</em> of the parent's context. A plain <code>await</code>
+      runs the child in the parent's <em>own</em> context.</p>
+
+    <div class="lab" id="inherit-lab">
+      <div class="lab__bar">
+        <span class="lab__label">Same child, two ways to call it</span>
+        <div class="controls">
+          <button type="button" data-act="step">Step&nbsp;▸</button>
+          <button type="button" data-act="reset">Reset</button>
+        </div>
+      </div>
+      <div class="inherit" data-columns></div>
+      <p class="lab__caption" data-caption aria-live="polite"></p>
+    </div>
+  </div>
+  <aside class="side">
+    <p><b>Rule of thumb.</b> <code>create_task</code>, <code>gather</code>,
+      <code>TaskGroup.create_task</code> → copy. Bare <code>await coro()</code>
+      → shared.</p>
+    <p class="warn">⚠ This is the opposite of C#, where an awaited
+      <code>async</code> method's AsyncLocal writes do <em>not</em> flow back.
+      See note&nbsp;06.</p>
+  </aside>
+</section>
+
+<!-- 03 ─────────────────────────────────────────────── -->
+<section class="note" id="token">
+  <div class="note__num">03</div>
+  <div class="note__body">
+    <h2>Set, then reset</h2>
+    <p><code>set()</code> returns a <code>Token</code> that remembers the
+      value from <em>before</em> the set. <code>reset(token)</code> puts it
+      back. Treat it like a <code>using</code> block, so a value never
+      outlives the work it was set for.</p>
+<pre class="code"><code class="py">token = request_id.set("req-42")
+try:
+    await handle()            # all code below sees "req-42"
+finally:
+    request_id.reset(token)   # back to what was there before</code></pre>
+    <ol class="ledger" aria-label="Value of request_id over time">
+      <li><span class="ledger__op">start</span><span class="ledger__val">"none"</span><span class="ledger__note">the default</span></li>
+      <li><span class="ledger__op">set("req-42")</span><span class="ledger__val">"req-42"</span><span class="ledger__note">token remembers "none"</span></li>
+      <li><span class="ledger__op">reset(token)</span><span class="ledger__val">"none"</span><span class="ledger__note">restored, not cleared</span></li>
+    </ol>
+  </div>
+  <aside class="side">
+    <p><b>Restore, not default.</b> <code>reset()</code> goes back to the
+      value before <em>that</em> set, even if more sets came after it.</p>
+    <p>Python 3.14+: <code>with request_id.set("x"):</code> does the
+      try/finally for you.</p>
+    <p class="analogy">≈ Serilog's <code>using (LogContext.PushProperty(…))</code></p>
+  </aside>
+</section>
+
+<!-- 04 ─────────────────────────────────────────────── -->
+<section class="note" id="threads">
+  <div class="note__num">04</div>
+  <div class="note__body">
+    <h2>Crossing into threads</h2>
+    <p>Each OS thread has its own current context. Whether your value
+      follows you depends on whether the API <strong>copies the context
+      across</strong> for you.</p>
+    <div class="table-wrap">
+      <table class="grid">
+        <thead><tr><th>You call</th><th>Child sees the value?</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><code>await f()</code></td><td><span class="stamp ok">shared</span></td><td>same Task, same context</td></tr>
+          <tr><td><code>asyncio.create_task(f())</code></td><td><span class="stamp ok">copy</span></td><td>Task snapshots the context</td></tr>
+          <tr><td><code>asyncio.to_thread(f)</code></td><td><span class="stamp ok">copy</span></td><td>copies, then runs <code>f</code> inside it</td></tr>
+          <tr><td><code>loop.run_in_executor(None, f)</code></td><td><span class="stamp no">no</span></td><td>the pool thread's own context</td></tr>
+          <tr><td><code>threading.Thread(target=f)</code></td><td><span class="stamp no">no</span></td><td>a new thread starts empty</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Fix the two <span class="stamp no">no</span> rows by carrying the
+      context yourself:</p>
+<pre class="code"><code class="py">ctx = contextvars.copy_context()
+await loop.run_in_executor(None, ctx.run, f)</code></pre>
+  </div>
+  <aside class="side">
+    <p><b>Default to <code>to_thread</code>.</b> It exists so you don't
+      have to remember this table.</p>
+    <p class="analogy">≈ <code>copy_context()</code> + <code>ctx.run</code>
+      is <code>ExecutionContext.Capture()</code> +
+      <code>ExecutionContext.Run</code>.</p>
+  </aside>
+</section>
+
+<!-- 05 ─────────────────────────────────────────────── -->
+<section class="note" id="traps">
+  <div class="note__num">05</div>
+  <div class="note__body">
+    <h2>Three traps</h2>
+    <ol class="traps">
+      <li>
+        <h3>The copy is shallow</h3>
+        <p>A Task copies the <em>reference</em>. Mutate a list or dict and
+          every task holding that reference sees it.</p>
+<pre class="code"><code class="py">log.set([])
+await asyncio.create_task(child())   # child: log.get().append("x")
+log.get()                            # ["x"]  — leaked up</code></pre>
+        <p class="fix">Store immutable values (str, tuple, frozen dataclass)
+          and <code>set()</code> a new one to change it.</p>
+      </li>
+      <li>
+        <h3>Create it once, at module level</h3>
+        <p>Every <code>ContextVar("x")</code> call makes a
+          <em>new, unrelated</em> variable. One built inside a function is a
+          different key from the one you set elsewhere.</p>
+<pre class="code"><code class="py">def get_id():
+    return ContextVar("request_id").get()   # always fails: brand new var</code></pre>
+      </li>
+      <li>
+        <h3>No default means LookupError</h3>
+        <p><code>.get()</code> on a var with no default and no value raises.
+          Pass a default to the constructor, or to <code>.get()</code>.</p>
+<pre class="code"><code class="py">user = ContextVar("user")
+user.get()          # LookupError
+user.get(None)      # None</code></pre>
+      </li>
+    </ol>
+  </div>
+  <aside class="side">
+    <p><b>Same with defaults.</b> <code>ContextVar("x", default=[])</code>
+      hands the <em>same</em> list to every task that never set one.</p>
+  </aside>
+</section>
+
+<!-- 06 ─────────────────────────────────────────────── -->
+<section class="note" id="dotnet">
+  <div class="note__num">06</div>
+  <div class="note__body">
+    <h2>Coming from C#</h2>
+    <p>The model maps almost one to one onto <code>AsyncLocal&lt;T&gt;</code>
+      and <code>ExecutionContext</code>. The rows marked
+      <span class="stamp diff">differs</span> are where your C# instincts will
+      mislead you.</p>
+    <div class="table-wrap">
+      <table class="grid map">
+        <thead><tr><th>Python</th><th>C#</th><th></th></tr></thead>
+        <tbody>
+          <tr><td><code>ContextVar[T]</code></td><td><code>AsyncLocal&lt;T&gt;</code></td><td></td></tr>
+          <tr><td><code>Context</code></td><td><code>ExecutionContext</code></td><td></td></tr>
+          <tr><td><code>copy_context()</code></td><td><code>ExecutionContext.Capture()</code></td><td></td></tr>
+          <tr><td><code>ctx.run(fn)</code></td><td><code>ExecutionContext.Run(ctx, cb, state)</code></td><td></td></tr>
+          <tr><td><code>create_task()</code> copies</td><td><code>Task.Run()</code> flows</td><td></td></tr>
+          <tr class="is-diff"><td><code>await coro()</code>: child writes <b>reach</b> the caller</td><td><code>await FooAsync()</code>: child writes <b>are undone</b> on return</td><td><span class="stamp diff">differs</span></td></tr>
+          <tr class="is-diff"><td><code>threading.Thread</code> starts <b>empty</b></td><td><code>new Thread()</code> <b>flows</b> the context</td><td><span class="stamp diff">differs</span></td></tr>
+          <tr class="is-diff"><td><code>run_in_executor</code> does <b>not</b> copy</td><td><code>ThreadPool.QueueUserWorkItem</code> <b>flows</b></td><td><span class="stamp diff">differs</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <aside class="side">
+    <p><b>Why the first difference?</b> A C# <code>async</code> method
+      restores the caller's ExecutionContext when it returns. A Python
+      coroutine is just a function call on the same Task, so nothing is
+      restored.</p>
+  </aside>
+</section>
+
+<!-- 07 ─────────────────────────────────────────────── -->
+<section class="note" id="quiz">
+  <div class="note__num">07</div>
+  <div class="note__body">
+    <h2>Predict the output</h2>
+    <p>Each snippet was run on Python 3.12. Pick an answer before you
+      peek. <span class="score" data-score></span></p>
+    <div class="quiz" data-quiz></div>
+    <button type="button" class="quiz__reset" data-quiz-reset>Clear answers</button>
+  </div>
+</section>
+
+</main>
+
+<footer class="colophon">
+  <p>Run the real thing:</p>
+<pre class="code"><code>python context_vars_demo.py
+pytest -q</code></pre>
+  <p class="colophon__small">Notes 01 and 02 replay exactly what
+    <code>test_context_vars_demo.py</code> asserts.</p>
+</footer>
+
+<script src="js/highlight.js"></script>
+<script src="js/race.js"></script>
+<script src="js/inherit.js"></script>
+<script src="js/quiz.js"></script>
+</body>
+</html>
