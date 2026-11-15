@@ -1,0 +1,1528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>From AsyncLocal to ContextVar</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+/* Layout: a sticky section rail on the left, one reading column on the
+   right, interactive figures break to the full column width.
+   Color encodes ownership: every asyncio Task has its own hue (A blue,
+   B orange, C teal) and a value is drawn in the hue of the Task that
+   wrote it. Purple marks a .NET parallel, red marks a leak or a bug. */
+:root {
+  --paper: #ECEFEF;
+  --sheet: #F8FAFA;
+  --well: #E0E6E7;
+  --ink: #142024;
+  --ink-2: #4A5A60;
+  --rule: #C3CDCF;
+  --ta: #2F5FB3;
+  --ta-soft: #DCE5F5;
+  --tb: #B8540E;
+  --tb-soft: #F6E2D2;
+  --tc: #15806A;
+  --tc-soft: #D3EBE4;
+  --net: #6B3FBF;
+  --net-soft: #E8E0F7;
+  --err: #B42335;
+  --err-soft: #F6DADD;
+  --str: #5D6A1C;
+  --term-bg: #0F181B;
+  --term-fg: #D5E0E2;
+  --term-dim: #7B8C91;
+  --term-ok: #7FD3BE;
+  --term-err: #F38B98;
+  --f-display: "Avenir Next", "Avenir", "Segoe UI Variable Display",
+    "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "Iowan Old Style", "Palatino Linotype", "Palatino",
+    "Sitka Text", Georgia, serif;
+  --f-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono",
+    Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0D1416; --sheet: #141E21; --well: #1B272B;
+    --ink: #E1E9EA; --ink-2: #98A9AE; --rule: #29383C;
+    --ta: #7EA6EE; --ta-soft: #1B2A44; --tb: #F0995A; --tb-soft: #3D2615;
+    --tc: #5CC7AE; --tc-soft: #12332C; --net: #AE8FF3; --net-soft: #271E43;
+    --err: #F07583; --err-soft: #3C1A1F; --str: #BCC57D; --term-bg: #070C0E;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0D1416; --sheet: #141E21; --well: #1B272B;
+  --ink: #E1E9EA; --ink-2: #98A9AE; --rule: #29383C;
+  --ta: #7EA6EE; --ta-soft: #1B2A44; --tb: #F0995A; --tb-soft: #3D2615;
+  --tc: #5CC7AE; --tc-soft: #12332C; --net: #AE8FF3; --net-soft: #271E43;
+  --err: #F07583; --err-soft: #3C1A1F; --str: #BCC57D; --term-bg: #070C0E;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--f-body);
+  font-size: 1.0625rem;
+  line-height: 1.6;
+}
+a { color: var(--ta); }
+code, pre, kbd { font-family: var(--f-mono); }
+p code, li code, td code, .note code, .cap code, .gotcha code {
+  font-size: 0.86em;
+  background: var(--well);
+  padding: 0.08em 0.32em;
+  border-radius: 2px;
+}
+:focus-visible { outline: 2px solid var(--ta); outline-offset: 2px; }
+
+/* hue helpers: one per Task */
+.h-A { --h: var(--ta); --hs: var(--ta-soft); }
+.h-B { --h: var(--tb); --hs: var(--tb-soft); }
+.h-C { --h: var(--tc); --hs: var(--tc-soft); }
+.h-X { --h: var(--err); --hs: var(--err-soft); }
+.h-0 { --h: var(--ink-2); --hs: var(--well); }
+
+.page {
+  max-width: 1220px;
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 40px 120px;
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 56px;
+}
+main { min-width: 0; }
+
+/* ---------- section rail ---------- */
+.rail {
+  position: sticky;
+  top: calc(env(safe-area-inset-top, 0px) + 32px);
+  align-self: start;
+  font-family: var(--f-mono);
+  font-size: 0.8125rem;
+}
+.rail-label {
+  font-size: 0.6875rem; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--ink-2); padding-bottom: 8px;
+  border-bottom: 1px solid var(--rule); margin: 0 0 6px;
+}
+.rail ol { list-style: none; margin: 0; padding: 0; }
+.rail li:nth-child(3n+1) a { --dot: var(--ta); }
+.rail li:nth-child(3n+2) a { --dot: var(--tb); }
+.rail li:nth-child(3n) a { --dot: var(--tc); }
+.rail a {
+  display: grid; grid-template-columns: 14px 1fr; gap: 6px;
+  align-items: center; padding: 5px 6px 5px 0;
+  color: var(--ink-2); text-decoration: none;
+}
+.rail a::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid var(--rule); justify-self: center;
+  transition: background-color 0.2s, border-color 0.2s;
+}
+.rail a:hover { color: var(--ink); }
+.rail a.active { color: var(--ink); font-weight: 600; }
+.rail a.active::before { background: var(--dot); border-color: var(--dot); }
+.rail-hint { margin-top: 14px; font-size: 0.6875rem; color: var(--ink-2); line-height: 1.5; }
+
+/* ---------- type ---------- */
+h1, h2, h3 { font-family: var(--f-display); font-weight: 700; margin: 0; }
+h2 {
+  font-size: clamp(1.9rem, 3.8vw, 2.6rem);
+  line-height: 1.06; letter-spacing: -0.01em; text-wrap: balance;
+}
+h3 { font-size: 1.3rem; line-height: 1.15; }
+.eyebrow {
+  font-family: var(--f-mono); font-size: 0.75rem; letter-spacing: 0.06em;
+  color: var(--ink-2); display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+}
+.prose { max-width: 66ch; display: grid; gap: 14px; }
+.prose p { margin: 0; }
+.lede { font-size: 1.2rem; line-height: 1.5; max-width: 60ch; margin: 0; }
+section { padding-top: 88px; display: grid; gap: 22px; scroll-margin-top: 24px; }
+.sec-head { display: grid; gap: 10px; }
+
+/* ---------- hero ---------- */
+.hero { display: grid; gap: 24px; padding-top: 8px; }
+.hero h1 {
+  font-size: clamp(2.7rem, 7.6vw, 5.4rem);
+  line-height: 0.98; letter-spacing: -0.025em;
+}
+.hero h1 > span { display: block; }
+.tri {
+  background-image: linear-gradient(90deg,
+    var(--ta) 0 33.3%, var(--tb) 33.3% 66.6%, var(--tc) 66.6% 100%);
+  background-repeat: no-repeat;
+  background-size: 100% 0.12em;
+  background-position: 0 94%;
+  animation: tri 0.9s 0.3s cubic-bezier(.6,.1,.2,1) both;
+}
+@keyframes tri { from { background-size: 0% 0.12em; } }
+.calls {
+  display: grid; gap: 10px; max-width: 620px;
+  background: var(--sheet); border: 1px solid var(--rule); padding: 16px 18px;
+}
+.call {
+  display: grid;
+  grid-template-columns: 70px max-content minmax(20px, 1fr) max-content;
+  align-items: center; gap: 12px;
+  font-family: var(--f-mono); font-size: 0.95rem;
+}
+.tchip {
+  font-family: var(--f-mono); font-size: 0.7rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--h);
+  border-left: 3px solid var(--h); padding-left: 7px; font-weight: 600;
+}
+.wire { height: 2px; background: var(--h); position: relative; }
+.wire::after {
+  content: ""; position: absolute; right: -1px; top: -4px;
+  border: 5px solid transparent; border-left: 7px solid var(--h); border-right: 0;
+}
+.val {
+  font-family: var(--f-mono); font-weight: 700; padding: 1px 10px;
+  background: var(--hs); color: var(--h);
+  animation: pop 0.5s cubic-bezier(.3,.7,.3,1) both;
+}
+.call:nth-child(2) .val { animation-delay: 0.15s; }
+.call:nth-child(3) .val { animation-delay: 0.3s; }
+@keyframes pop { from { transform: translateX(-16px); opacity: 0.35; } }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.legend span {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: var(--f-mono); font-size: 0.75rem; color: var(--ink-2);
+}
+.legend i { width: 14px; height: 14px; display: inline-block; }
+
+/* ---------- chips ---------- */
+.chip {
+  display: inline-block; font-family: var(--f-mono); font-size: 0.6875rem;
+  letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 7px;
+  border-radius: 2px; white-space: nowrap;
+}
+.c-ink { background: var(--well); color: var(--ink); }
+.c-same { background: var(--well); color: var(--ink-2); }
+.c-net { background: var(--net-soft); color: var(--net); }
+.c-err { background: var(--err-soft); color: var(--err); }
+.c-copy { background: var(--tc-soft); color: var(--tc); }
+.c-only { border: 1px solid var(--rule); color: var(--ink-2); }
+
+/* ---------- code ---------- */
+pre.code {
+  margin: 0; background: var(--well); padding: 14px 16px;
+  font-size: 0.84rem; line-height: 1.6; overflow-x: auto;
+  border-radius: 2px; tab-size: 4; color: var(--ink);
+}
+.code-title {
+  font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-2); margin: 0 0 6px;
+  display: flex; justify-content: space-between; gap: 8px;
+}
+.tk-k { font-weight: 700; }
+.tk-s { color: var(--str); }
+.tk-c { color: var(--ink-2); font-style: italic; }
+.tk-d { color: var(--ink-2); }
+.cs .tk-k { color: var(--net); }
+
+/* ---------- .NET callout ---------- */
+.note {
+  background: var(--net-soft);
+  border: 1px solid color-mix(in srgb, var(--net) 28%, transparent);
+  padding: 14px 16px; max-width: 72ch; display: grid; gap: 6px; font-size: 0.98rem;
+}
+.note > b {
+  font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--net); font-weight: 600;
+}
+.note p { margin: 0; }
+.note code { background: color-mix(in srgb, var(--net) 12%, transparent); }
+.note.warn { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 30%, transparent); }
+.note.warn > b { color: var(--err); }
+.note.warn code { background: color-mix(in srgb, var(--err) 12%, transparent); }
+
+/* ---------- grids, tables ---------- */
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td {
+  text-align: left; padding: 10px 14px 10px 0;
+  border-bottom: 1px solid var(--rule); vertical-align: top;
+}
+th {
+  font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-2); font-weight: 500;
+}
+td:first-child { font-weight: 600; }
+td.wrap code { overflow-wrap: anywhere; }
+caption.code-title { display: table-caption; caption-side: top; text-align: left; }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; counter-reset: s; max-width: 66ch; }
+.steps li {
+  counter-increment: s; display: grid; grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px; font-size: 0.98rem;
+}
+.steps li::before {
+  content: counter(s); font-family: var(--f-display); font-weight: 700;
+  font-size: 1.3rem; line-height: 1.2; color: var(--ink-2);
+}
+.steps li.fail::before { color: var(--err); }
+
+/* ---------- buttons ---------- */
+.btn {
+  font-family: var(--f-mono); font-size: 0.78rem; letter-spacing: 0.06em;
+  text-transform: uppercase; background: transparent; color: var(--ink);
+  border: 1px solid var(--ink); padding: 7px 12px; border-radius: 0; cursor: pointer;
+}
+.btn:hover { background: var(--ink); color: var(--paper); }
+.btn.primary { background: var(--ink); color: var(--paper); }
+.btn.primary:hover { background: var(--ta); border-color: var(--ta); }
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn:disabled:hover { background: transparent; color: var(--ink); }
+.btn.primary:disabled:hover { background: var(--ink); color: var(--paper); }
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--ink); }
+.seg label {
+  font-family: var(--f-mono); font-size: 0.75rem; padding: 7px 11px;
+  cursor: pointer; color: var(--ink-2); position: relative;
+}
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--ink); color: var(--paper); }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--ta); outline-offset: 1px; }
+
+/* ---------- simulator shell (race, inherit) ---------- */
+.sim { background: var(--sheet); border: 1px solid var(--rule); }
+.sim-bar {
+  display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center;
+  justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--rule);
+}
+.ctrl { display: flex; gap: 8px; flex-wrap: wrap; }
+.pane-head {
+  font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-2); padding: 8px 12px;
+  border-bottom: 1px dashed var(--rule);
+}
+.cap {
+  display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 4px 12px;
+  padding: 12px 14px; border-top: 1px solid var(--rule); min-height: 100px;
+  align-content: start;
+}
+.cap-n {
+  font-family: var(--f-mono); font-size: 0.75rem; color: var(--ink-2);
+  font-variant-numeric: tabular-nums; padding-top: 3px;
+}
+.cap p { margin: 0; }
+.cap .cap-net { grid-column: 2; color: var(--net); font-size: 0.94rem; }
+.cap .cap-net:empty { display: none; }
+.term {
+  background: var(--term-bg); color: var(--term-fg); font-family: var(--f-mono);
+  font-size: 0.8rem; line-height: 1.65; padding: 12px 14px; overflow-x: auto;
+}
+.term .line { white-space: pre; }
+.term .line.fresh { animation: termIn 0.28s ease both; }
+@keyframes termIn { from { opacity: 0.15; transform: translateY(3px); } }
+.l-dim { color: var(--term-dim); }
+.l-ok { color: var(--term-ok); }
+.l-err { color: var(--term-err); }
+
+/* race: lanes + storage */
+.race-grid { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); }
+.lanes-scroll { overflow-x: auto; min-width: 0; border-right: 1px solid var(--rule); }
+.lanes { min-width: 580px; display: grid; gap: 10px; padding: 16px 14px 14px; }
+.lane { display: grid; grid-template-columns: 82px repeat(3, minmax(0, 1fr)); gap: 8px; align-items: stretch; }
+.lane.head { font-family: var(--f-mono); font-size: 0.65rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.lane-lab {
+  font-family: var(--f-mono); font-size: 0.7rem; color: var(--h);
+  border-left: 3px solid var(--h); padding-left: 8px; display: grid; align-content: center;
+}
+.lane-lab b { font-size: 0.82rem; }
+.cell {
+  font-family: var(--f-mono); font-size: 0.74rem; line-height: 1.4; padding: 8px;
+  border: 1px dashed var(--rule); color: var(--ink-2); position: relative;
+  min-height: 56px; display: grid; align-content: center; gap: 3px;
+  transition: background-color 0.25s, border-color 0.25s, color 0.25s;
+}
+.cell { min-width: 0; }
+.cell code { white-space: normal; overflow-wrap: anywhere; }
+.cell.done { background: var(--hs); border: 1px solid color-mix(in srgb, var(--h) 40%, transparent); color: var(--ink); }
+.cell.wait {
+  background: repeating-linear-gradient(135deg, var(--hs) 0 6px, transparent 6px 11px);
+  border: 1px solid color-mix(in srgb, var(--h) 40%, transparent); color: var(--ink);
+}
+.cell.cur { outline: 2px solid var(--h); outline-offset: 1px; }
+.cell.cur::before {
+  content: "\25B6  thread"; position: absolute; top: -9px; left: 6px;
+  font-size: 0.6rem; letter-spacing: 0.05em; background: var(--h); color: var(--sheet);
+  padding: 0 5px; line-height: 1.5;
+}
+.sub { font-size: 0.66rem; color: var(--ink-2); }
+.res { font-weight: 700; }
+.res.ok { color: var(--h); }
+.res.bad { color: var(--err); }
+.store { padding: 14px; display: grid; gap: 10px; align-content: start; min-width: 0; }
+.store-h { font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); }
+.slot { border: 2px solid var(--ink); padding: 10px 12px; display: grid; gap: 8px; background: var(--paper); }
+.slot-name { font-family: var(--f-mono); font-size: 0.8rem; }
+.hist { font-family: var(--f-mono); font-size: 0.72rem; color: var(--ink-2); }
+.hist s { color: var(--err); }
+.pill {
+  display: inline-block; font-family: var(--f-mono); font-weight: 700; font-size: 0.82rem;
+  padding: 1px 9px; background: var(--hs); color: var(--h); justify-self: start;
+  transition: background-color 0.25s, color 0.25s;
+}
+.pill.unset { font-weight: 400; background: transparent; color: var(--ink-2); padding-left: 0; }
+.ctxcard {
+  border: 1px solid var(--rule); border-left: 4px solid var(--h); padding: 8px 10px;
+  background: var(--paper); font-family: var(--f-mono); font-size: 0.78rem;
+  display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center;
+}
+.ctxcard .ttl { flex-basis: 100%; font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--h); }
+.ctxcard .k { color: var(--ink-2); }
+
+/* model: thread, contexts, lookups */
+.model { background: var(--sheet); border: 1px solid var(--rule); }
+.model-grid {
+  display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) minmax(0, 1fr);
+  gap: 18px; padding: 16px; align-items: start;
+}
+.col-h { font-family: var(--f-mono); font-size: 0.6875rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-2); margin: 0 0 8px; }
+.m-thread {
+  border: 2px solid var(--ink); padding: 12px; background: var(--paper);
+  font-family: var(--f-mono); font-size: 0.8rem; display: grid; gap: 8px;
+}
+.m-ctxs { display: grid; gap: 8px; }
+.mcard {
+  border: 1px solid var(--rule); border-left: 4px solid var(--h); padding: 8px 10px;
+  font-family: var(--f-mono); font-size: 0.78rem; background: var(--paper);
+  display: grid; gap: 3px; opacity: 0.5; transition: opacity 0.25s, box-shadow 0.25s;
+}
+.mcard.on { opacity: 1; box-shadow: 0 0 0 2px var(--h); }
+.mcard .ttl { font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--h); display: flex; justify-content: space-between; gap: 8px; }
+.mcard .cur-tag { color: var(--h); visibility: hidden; }
+.mcard.on .cur-tag { visibility: visible; }
+.kvrow { display: grid; grid-template-columns: 11ch 3ch auto; }
+.kvrow .k { color: var(--ink-2); }
+.kvrow .missing { color: var(--ink-2); font-style: italic; }
+.m-expr { display: grid; gap: 10px; }
+.lookup {
+  border: 1px solid var(--rule); background: var(--paper); padding: 10px 12px;
+  font-family: var(--f-mono); font-size: 0.8rem; display: grid; gap: 6px;
+}
+.lookup .why { font-family: var(--f-body); font-size: 0.86rem; color: var(--ink-2); }
+
+/* inherit: code panes + contexts */
+.inh-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); }
+.inh-code { border-right: 1px solid var(--rule); min-width: 0; }
+.inh-code .pane + .pane { border-top: 1px solid var(--rule); }
+.lines { overflow-x: auto; padding-block: 6px; }
+.lines-inner { display: inline-block; min-width: 100%; }
+.ln {
+  display: grid; grid-template-columns: 22px max-content; font-family: var(--f-mono);
+  font-size: 0.8rem; line-height: 1.85; white-space: pre; padding-right: 14px;
+  transition: background-color 0.2s;
+}
+.ln .arrow { color: transparent; text-align: center; font-size: 0.7rem; }
+.ln.cur { background: var(--hs); }
+.ln.cur .arrow { color: var(--h); }
+.inh-ctx { padding: 14px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.ctxbox {
+  border: 2px solid var(--h); background: var(--paper); padding: 10px 12px;
+  display: grid; gap: 8px; font-family: var(--f-mono); font-size: 0.8rem;
+  transition: opacity 0.25s;
+}
+.ctxbox .ttl { font-size: 0.66rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--h); }
+.ctxbox .row { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.ctxbox .k { color: var(--ink-2); }
+.ctxbox.nested { border-style: dashed; border-width: 1.5px; background: var(--sheet); }
+.ctxbox.ghost { opacity: 0.28; }
+.copy-arrow {
+  font-family: var(--f-mono); font-size: 0.72rem; color: var(--tc);
+  padding-left: 14px; transition: opacity 0.25s;
+}
+.copy-arrow.ghost { opacity: 0.2; }
+
+/* token staircase */
+.stair-wrap { overflow-x: auto; background: var(--sheet); border: 1px solid var(--rule); }
+.stair { display: grid; grid-template-columns: repeat(5, minmax(172px, 1fr)); min-width: 880px; }
+.tcol { display: grid; grid-template-rows: auto 112px auto; gap: 10px; padding: 14px 12px; border-left: 1px solid var(--rule); }
+.tcol:first-child { border-left: 0; }
+.tcol > code { font-size: 0.74rem; white-space: nowrap; }
+.tstack { display: flex; flex-direction: column-reverse; gap: 4px; justify-content: flex-start; border-bottom: 2px solid var(--ink); padding-bottom: 4px; }
+.tstack span {
+  font-family: var(--f-mono); font-size: 0.74rem; padding: 4px 8px;
+  background: var(--hs); color: var(--h); border: 1px solid color-mix(in srgb, var(--h) 35%, transparent);
+}
+.tstack span.top { font-weight: 700; }
+.tnote { font-family: var(--f-mono); font-size: 0.7rem; color: var(--ink-2); line-height: 1.45; }
+.tnote b { color: var(--ink); }
+
+/* FastAPI flow */
+.flow-wrap { overflow-x: auto; background: var(--sheet); border: 1px solid var(--rule); padding: 16px; }
+.flow { display: grid; grid-template-columns: repeat(4, minmax(130px, 1fr)); gap: 0; min-width: 680px; align-items: stretch; }
+.fbox {
+  border: 1px solid var(--rule); background: var(--paper); padding: 10px 12px;
+  font-family: var(--f-mono); font-size: 0.74rem; display: grid; gap: 6px; align-content: start;
+  position: relative; margin-right: 26px;
+}
+.fbox:last-child { margin-right: 0; }
+.fbox:not(:last-child)::after {
+  content: "\25B6"; position: absolute; right: -21px; top: 50%; transform: translateY(-50%);
+  color: var(--tc); font-size: 0.8rem;
+}
+.fbox > span { overflow-wrap: anywhere; }
+.fbox .ttl { font-size: 0.64rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); }
+.fbox .tag { font-size: 0.64rem; color: var(--tc); }
+.flow-back {
+  margin-top: 12px; font-family: var(--f-mono); font-size: 0.72rem; color: var(--err);
+  border-top: 1px dashed var(--rule); padding-top: 10px; min-width: 680px;
+}
+
+/* gotchas */
+.gotchas { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 36px; }
+.gotcha { border-top: 1px solid var(--rule); padding-block: 16px 20px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+.gotcha h3 { font-size: 1.2rem; }
+.gotcha p { margin: 0; font-size: 0.96rem; }
+.errmsg {
+  font-family: var(--f-mono); font-size: 0.78rem; color: var(--err);
+  background: var(--err-soft); padding: 6px 10px; overflow-x: auto; white-space: pre;
+}
+
+/* project files */
+.files { list-style: none; margin: 0; padding: 0; display: grid; counter-reset: f; }
+.files li {
+  counter-increment: f; display: grid; grid-template-columns: 44px minmax(0, 1fr) minmax(0, 1.1fr);
+  gap: 6px 18px; padding-block: 14px; border-top: 1px solid var(--rule); align-items: start;
+}
+.files li::before { content: counter(f); font-family: var(--f-display); font-weight: 700; font-size: 1.9rem; line-height: 0.95; color: var(--ink-2); }
+.files .fname { font-family: var(--f-mono); font-size: 0.86rem; font-weight: 600; overflow-wrap: anywhere; }
+.files p { margin: 0; font-size: 0.95rem; }
+.cmd { display: flex; min-width: 0; }
+.cmd code {
+  flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; background: var(--term-bg);
+  color: var(--term-fg); padding: 7px 10px; font-size: 0.78rem;
+}
+.cmd button { border-left: 0; }
+footer.colophon {
+  margin-top: 72px; padding-top: 14px; border-top: 1px solid var(--rule);
+  font-family: var(--f-mono); font-size: 0.72rem; color: var(--ink-2);
+}
+
+/* ---------- responsive + motion ---------- */
+@media (max-width: 1000px) {
+  .page { grid-template-columns: minmax(0, 1fr); gap: 8px; padding-top: 0; }
+  body::before {
+    content: ""; position: fixed; inset: 0 0 auto;
+    height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper);
+  }
+  .rail {
+    top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--paper);
+    border-bottom: 1px solid var(--rule); padding-block: 8px; overflow-x: auto;
+  }
+  .rail-label, .rail-hint { display: none; }
+  .rail ol { display: flex; gap: 4px; width: max-content; }
+  .rail a { white-space: nowrap; padding: 4px 8px 4px 0; }
+  .hero { padding-top: 28px; }
+}
+@media (max-width: 880px) {
+  .race-grid, .inh-grid, .model-grid { grid-template-columns: minmax(0, 1fr); }
+  .lanes-scroll { border-right: 0; border-bottom: 1px solid var(--rule); }
+  .inh-code { border-right: 0; border-bottom: 1px solid var(--rule); }
+}
+@media (max-width: 720px) {
+  .duo, .gotchas { grid-template-columns: minmax(0, 1fr); }
+  .cap { grid-template-columns: minmax(0, 1fr); }
+  .cap .cap-net { grid-column: 1; }
+  .files li { grid-template-columns: 36px minmax(0, 1fr); }
+  .files li > :last-child { grid-column: 2; }
+  .call { grid-template-columns: 62px max-content minmax(14px, 1fr) max-content; gap: 8px; font-size: 0.85rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important; animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+<nav class="rail" aria-label="Sections">
+  <p class="rail-label">Sections</p>
+  <ol id="rail-list">
+    <li><a href="#race">the bug</a></li>
+    <li><a href="#model">ContextVar · Context</a></li>
+    <li><a href="#inherit">create_task vs await</a></li>
+    <li><a href="#token">Token · reset</a></li>
+    <li><a href="#threads">threads</a></li>
+    <li><a href="#dotnet">AsyncLocal&lt;T&gt;</a></li>
+    <li><a href="#fastapi">request id in logs</a></li>
+    <li><a href="#testing">pytest</a></li>
+    <li><a href="#gotchas">gotchas</a></li>
+    <li><a href="#files">project files</a></li>
+  </ol>
+  <p class="rail-hint">The filled dot marks the section you're reading.
+    Its color cycles through the three Task hues.</p>
+</nav>
+
+<main>
+<header class="hero" id="top">
+  <div class="eyebrow">
+    <span>contextvars</span><span>·</span><span>PEP 567</span>
+    <span>·</span><span>Python 3.7+</span>
+  </div>
+  <h1><span>One variable.</span><span>A value per <span class="tri">task.</span></span></h1>
+  <p class="lede">A <code>ContextVar</code> reads like a global, but each
+    asyncio Task gets its own value. Set a request id at the top of a
+    request, and every function below can read it without passing it
+    down, even while other requests run on the same thread. If you know
+    C#'s <code>AsyncLocal&lt;T&gt;</code>, you have most of the idea. This
+    page covers the rest, including one rule that works the other way
+    round in Python.</p>
+  <div class="calls" role="img" aria-label="Three tasks call request_id.get() and get back A, B and C respectively">
+    <div class="call h-A"><span class="tchip">Task A</span><code>request_id.get()</code><span class="wire"></span><span class="val">"A"</span></div>
+    <div class="call h-B"><span class="tchip">Task B</span><code>request_id.get()</code><span class="wire"></span><span class="val">"B"</span></div>
+    <div class="call h-C"><span class="tchip">Task C</span><code>request_id.get()</code><span class="wire"></span><span class="val">"C"</span></div>
+  </div>
+  <div class="legend" aria-label="Color key">
+    <span><i style="background: var(--ta)"></i>Task A</span>
+    <span><i style="background: var(--tb)"></i>Task B</span>
+    <span><i style="background: var(--tc)"></i>Task C</span>
+    <span><i style="background: var(--net)"></i>.NET parallel</span>
+    <span><i style="background: var(--err)"></i>leak or bug</span>
+  </div>
+</header>
+
+<section id="race" aria-labelledby="race-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-err">the bug</span>
+      <span>context_vars_demo.py · handle_with_global / handle_with_context_var</span></div>
+    <h2 id="race-h">Three requests, one thread, one slot</h2>
+  </div>
+  <div class="prose">
+    <p>asyncio runs every Task on one thread and switches between them
+      only at an <code>await</code>. The demo starts three handlers with
+      <code>asyncio.gather()</code>. Each stores its id, waits for fake
+      I/O, then reads the id back.</p>
+    <p>Pick where the id is stored and press <b>Step</b>. You can switch
+      storage at any step to compare the same moment.</p>
+  </div>
+  <div class="sim" id="race-sim">
+    <div class="sim-bar">
+      <div class="seg" role="radiogroup" aria-label="Where the id is stored">
+        <label><input type="radio" name="race-mode" id="race-global" value="global" checked>module global</label>
+        <label><input type="radio" name="race-mode" id="race-cv" value="cv">ContextVar</label>
+      </div>
+      <div class="ctrl">
+        <button class="btn" id="race-back" type="button">&#9666; Back</button>
+        <button class="btn primary" id="race-step" type="button">Step &#9656;</button>
+        <button class="btn" id="race-run" type="button">Run all</button>
+      </div>
+    </div>
+    <div class="race-grid">
+      <div class="lanes-scroll"><div class="lanes" id="race-lanes"></div></div>
+      <div class="store" id="race-store"></div>
+    </div>
+    <div class="cap" aria-live="polite">
+      <span class="cap-n" id="race-n">0 / 9</span>
+      <p id="race-text"></p>
+      <p class="cap-net" id="race-net"></p>
+    </div>
+    <div class="term" id="race-term" aria-label="Terminal output"></div>
+  </div>
+</section>
+
+<section id="model" aria-labelledby="model-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">ContextVar · Context</span>
+      <span>Python docs, "contextvars: Context Variables"</span></div>
+    <h2 id="model-h">A key, a mapping, and a pointer</h2>
+  </div>
+  <div class="prose">
+    <p>Three objects do the work. A <code>ContextVar</code> is only a
+      key. It holds no value itself. A <code>Context</code> is a
+      read-only mapping from those keys to values. Each thread has one
+      current Context, and each Task carries its own. Every time the
+      event loop resumes a Task, it makes that Task's Context current
+      first.</p>
+  </div>
+<pre class="code" data-lang="py">request_id: ContextVar[str] = ContextVar("request_id", default="none")
+user_id: ContextVar[int] = ContextVar("user_id")  # no default</pre>
+  <div class="model" id="model-fig">
+    <div class="sim-bar">
+      <div class="seg" role="radiogroup" aria-label="Which Task the loop is running">
+        <label><input type="radio" name="model-task" id="model-a" value="A" checked>loop runs Task A</label>
+        <label><input type="radio" name="model-task" id="model-b" value="B">Task B</label>
+        <label><input type="radio" name="model-task" id="model-c" value="C">Task C</label>
+      </div>
+    </div>
+    <div class="model-grid">
+      <div>
+        <p class="col-h">The thread</p>
+        <div class="m-thread" id="m-thread">
+          <span>MainThread</span>
+          <span class="sub">current context &#9656;</span>
+          <span class="pill h-A" id="m-ptr">Task A's context</span>
+        </div>
+      </div>
+      <div>
+        <p class="col-h">Contexts, one per Task</p>
+        <div class="m-ctxs">
+          <div class="mcard h-A on" data-task="A"><span class="ttl"><span>Task A's context</span><span class="cur-tag">&#9664; current</span></span>
+            <span class="kvrow"><span class="k">request_id</span><span>&#8594;</span><span>"A"</span></span>
+            <span class="kvrow"><span class="k">user_id</span><span>&#8594;</span><span>41</span></span></div>
+          <div class="mcard h-B" data-task="B"><span class="ttl"><span>Task B's context</span><span class="cur-tag">&#9664; current</span></span>
+            <span class="kvrow"><span class="k">request_id</span><span>&#8594;</span><span>"B"</span></span>
+            <span class="kvrow"><span class="k">user_id</span><span>&#8594;</span><span>7</span></span></div>
+          <div class="mcard h-C" data-task="C"><span class="ttl"><span>Task C's context</span><span class="cur-tag">&#9664; current</span></span>
+            <span class="kvrow"><span class="k">request_id</span><span>&#8594;</span><span>"C"</span></span>
+            <span class="kvrow"><span class="k">user_id</span><span></span><span class="missing">not set</span></span></div>
+        </div>
+      </div>
+      <div>
+        <p class="col-h">What the code reads</p>
+        <div class="m-expr" aria-live="polite">
+          <div class="lookup"><code>request_id.get()</code><span class="pill h-A" id="m-r1">"A"</span>
+            <span class="why" id="m-w1">Found in the current context.</span></div>
+          <div class="lookup"><code>user_id.get(None)</code><span class="pill h-A" id="m-r2">41</span>
+            <span class="why" id="m-w2">Found in the current context.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <h3>How get() decides</h3>
+  <ol class="steps">
+    <li><span>The value in the current context, if this variable has one there.</span></li>
+    <li><span>Otherwise the default passed to <code>get()</code>, as in <code>user_id.get(None)</code>.</span></li>
+    <li><span>Otherwise the default passed to the constructor.</span></li>
+    <li class="fail"><span>Otherwise it raises <code>LookupError</code>.</span></li>
+  </ol>
+  <div class="note"><b>C# / .NET</b>
+    <p><code>ContextVar</code> &#8776; <code>AsyncLocal&lt;T&gt;</code>
+      and <code>Context</code> &#8776; <code>ExecutionContext</code>.
+      Both are immutable maps: a write builds a new map and makes it
+      current. That's why a snapshot is cheap. <code>copy_context()</code>
+      hands you the current map in O(1).</p>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Call</th><th>What it does</th><th>.NET</th></tr></thead>
+    <tbody>
+      <tr><td><code>ContextVar("request_id", default="none")</code></td><td>creates the key; do it once, at module level</td><td><code>static readonly AsyncLocal&lt;string&gt; RequestId = new();</code></td></tr>
+      <tr><td><code>request_id.get()</code></td><td>reads from the current context</td><td><code>RequestId.Value</code></td></tr>
+      <tr><td><code>request_id.set("A")</code></td><td>writes into the current context and returns a <code>Token</code></td><td><code>RequestId.Value = "A"</code></td></tr>
+      <tr><td><code>request_id.reset(token)</code></td><td>restores the value from before that <code>set()</code></td><td>no equivalent; assign the old value back</td></tr>
+      <tr><td><code>contextvars.copy_context()</code></td><td>a snapshot of the current context</td><td><code>ExecutionContext.Capture()</code></td></tr>
+      <tr><td><code>ctx.run(fn, *args)</code></td><td>runs <code>fn</code> with <code>ctx</code> as the current context</td><td><code>ExecutionContext.Run(ctx, callback, state)</code></td></tr>
+      <tr><td><code>ctx[request_id]</code></td><td>reads one value from a context you hold</td><td>no equivalent</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="inherit" aria-labelledby="inherit-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-copy">create_task vs await</span>
+      <span>parent_starts_child_task / parent_awaits_coroutine</span></div>
+    <h2 id="inherit-h">Copy down, never up</h2>
+  </div>
+  <div class="prose">
+    <p>The demo's <code>child_changes_value()</code> reads
+      <code>request_id</code>, then overwrites it. The parent calls it
+      two ways. Whether the child's write reaches the parent depends on
+      one question: did a new Task start?</p>
+  </div>
+  <div class="sim" id="inh-sim">
+    <div class="sim-bar">
+      <div class="seg" role="radiogroup" aria-label="How the parent calls the child">
+        <label><input type="radio" name="inh-mode" id="inh-task" value="task" checked>asyncio.create_task(child())</label>
+        <label><input type="radio" name="inh-mode" id="inh-await" value="await">await child()</label>
+      </div>
+      <div class="ctrl">
+        <button class="btn" id="inh-back" type="button">&#9666; Back</button>
+        <button class="btn primary" id="inh-step" type="button">Step &#9656;</button>
+        <button class="btn" id="inh-run" type="button">Run all</button>
+      </div>
+    </div>
+    <div class="inh-grid">
+      <div class="inh-code">
+        <div class="pane h-A"><div class="pane-head" id="inh-phead">Parent · parent_starts_child_task</div>
+          <div class="lines"><div class="lines-inner" id="inh-parent"></div></div></div>
+        <div class="pane h-B"><div class="pane-head">Child · child_changes_value</div>
+          <div class="lines"><div class="lines-inner" id="inh-child"></div></div></div>
+      </div>
+      <div class="inh-ctx" id="inh-ctx"></div>
+    </div>
+    <div class="cap" aria-live="polite">
+      <span class="cap-n" id="inh-n">0 / 5</span>
+      <p id="inh-text"></p>
+      <p class="cap-net" id="inh-net"></p>
+    </div>
+    <div class="term" id="inh-term" aria-label="Terminal output"></div>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Start the child with</th><th>Child runs in</th><th>Child's set() reaches the parent?</th></tr></thead>
+    <tbody>
+      <tr><td><code>await child()</code></td><td>the parent's own context</td><td><span class="chip c-err">yes</span></td></tr>
+      <tr><td><code>asyncio.create_task(child())</code></td><td>a copy</td><td><span class="chip c-copy">no</span></td></tr>
+      <tr><td><code>asyncio.gather(child(), ...)</code></td><td>a copy per coroutine</td><td><span class="chip c-copy">no</span></td></tr>
+      <tr><td><code>async with asyncio.TaskGroup() as tg:</code><br><code>tg.create_task(child())</code></td><td>a copy</td><td><span class="chip c-copy">no</span></td></tr>
+      <tr><td><code>asyncio.create_task(child(), context=ctx)</code></td><td>the <code>ctx</code> you pass (3.11+)</td><td>into <code>ctx</code> only</td></tr>
+    </tbody>
+  </table></div>
+  <div class="note warn"><b>Where C# instincts mislead</b>
+    <p>In C#, an awaited async method gets a copy-on-write
+      <code>ExecutionContext</code>, and its <code>AsyncLocal</code>
+      writes are gone when it returns. In Python a bare
+      <code>await</code> is a plain call on the same Task, so the write
+      sticks. If you want isolation, start a Task.</p>
+  </div>
+</section>
+
+<section id="token" aria-labelledby="token-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">Token · reset</span></div>
+    <h2 id="token-h">Set, then reset</h2>
+  </div>
+  <div class="prose">
+    <p><code>set()</code> returns a <code>Token</code> that remembers the
+      value from before the call. <code>reset(token)</code> puts that
+      value back. Pair them in <code>try/finally</code>, the way you'd
+      pair a constructor with <code>Dispose()</code>, so a value never
+      outlives the work it was set for.</p>
+  </div>
+  <div class="duo">
+    <div><p class="code-title"><span>Python 3.7+</span><span>try / finally</span></p>
+<pre class="code" data-lang="py">token = request_id.set("req-42")
+try:
+    await handle()           # everything in here sees "req-42"
+finally:
+    request_id.reset(token)  # back to what was there before</pre></div>
+    <div><p class="code-title"><span>Python 3.14+</span><span>Token is a context manager</span></p>
+<pre class="code" data-lang="py">with request_id.set("req-42"):
+    await handle()
+# reset() has run here</pre></div>
+  </div>
+  <div class="stair-wrap" role="img" aria-label="Five moments: no value, set req-42, set retry-1, reset back to req-42, reset back to no value">
+    <div class="stair">
+      <div class="tcol"><code>start</code>
+        <div class="tstack"></div>
+        <span class="tnote">no value set<br><b>get() &#8594; "none"</b> (default)</span></div>
+      <div class="tcol h-A"><code>t1 = set("req-42")</code>
+        <div class="tstack"><span class="top">"req-42"</span></div>
+        <span class="tnote">t1 remembers <b>no value</b><br>(<code>Token.MISSING</code>)</span></div>
+      <div class="tcol h-B"><code>t2 = set("retry-1")</code>
+        <div class="tstack"><span class="h-A">"req-42"</span><span class="top">"retry-1"</span></div>
+        <span class="tnote">t2 remembers <b>"req-42"</b></span></div>
+      <div class="tcol h-A"><code>reset(t2)</code>
+        <div class="tstack"><span class="top">"req-42"</span></div>
+        <span class="tnote">back to <b>"req-42"</b></span></div>
+      <div class="tcol"><code>reset(t1)</code>
+        <div class="tstack"></div>
+        <span class="tnote">back to <b>no value</b><br><b>get() &#8594; "none"</b> again</span></div>
+    </div>
+  </div>
+  <div class="prose"><p><b>Restore, not clear.</b> <code>reset()</code>
+    goes back to whatever was there before that <code>set()</code>. When
+    that was no value at all, <code>get()</code> falls back to the
+    default again.</p></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Misuse</th><th>What you get</th></tr></thead>
+    <tbody>
+      <tr><td>Reset with the same token twice</td><td><code>RuntimeError: &lt;Token used ...&gt; has already been used once</code></td></tr>
+      <tr><td>Reset in a different context than the set</td><td><code>ValueError: &lt;Token ...&gt; was created in a different Context</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>C# / .NET</b>
+    <p><code>AsyncLocal&lt;T&gt;</code> has no token. The C# habit is a
+      disposable scope that saves and restores, like Serilog's
+      <code>using (LogContext.PushProperty("RequestId", id))</code>.
+      Python 3.14's <code>with request_id.set(...)</code> is the same
+      shape.</p>
+  </div>
+</section>
+
+<section id="threads" aria-labelledby="threads-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">threads</span>
+      <span>checked on Python 3.12.4</span></div>
+    <h2 id="threads-h">Crossing into threads</h2>
+  </div>
+  <div class="prose">
+    <p>Each OS thread has its own current context. Code you hand to
+      another thread sees your values only if the API copies the context
+      across. Each row below ran with <code>request_id</code> set to
+      <code>"req-1"</code> first.</p>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>You call</th><th>f() reads</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>await f()</code></td><td><span class="chip c-ink">"req-1" · shared</span></td><td>same Task, same context</td></tr>
+      <tr><td><code>asyncio.create_task(f())</code></td><td><span class="chip c-copy">"req-1" · copy</span></td><td>the Task snapshots the context</td></tr>
+      <tr><td><code>asyncio.to_thread(f)</code></td><td><span class="chip c-copy">"req-1" · copy</span></td><td>copies the context, then runs <code>f</code> inside it</td></tr>
+      <tr><td><code>loop.run_in_executor(None, f)</code></td><td><span class="chip c-err">"none"</span></td><td>runs in the pool thread's own context</td></tr>
+      <tr><td><code>threading.Thread(target=f)</code></td><td><span class="chip c-err">"none"</span></td><td>a new thread starts with an empty context; 3.14 adds a <code>context=</code> argument</td></tr>
+      <tr><td>FastAPI sync endpoint (<code>def</code>)</td><td><span class="chip c-copy">"req-1" · copy</span></td><td>anyio's worker threads run each call in a copy</td></tr>
+    </tbody>
+  </table></div>
+  <div class="duo">
+    <div><p class="code-title"><span>Fix the two red rows</span><span>carry the context yourself</span></p>
+<pre class="code" data-lang="py">ctx = contextvars.copy_context()
+await loop.run_in_executor(None, ctx.run, f)</pre></div>
+    <div class="prose" style="align-content: start"><p>Better: default to
+      <code>asyncio.to_thread(f)</code>. It does the copy for you, so you
+      never have to remember this table.</p></div>
+  </div>
+  <div class="note warn"><b>Where C# instincts mislead</b>
+    <p>.NET flows the <code>ExecutionContext</code> into
+      <code>Task.Run</code>, <code>ThreadPool.QueueUserWorkItem</code> and
+      <code>new Thread()</code> by default, and you opt out with
+      <code>ExecutionContext.SuppressFlow()</code>. Python is the
+      reverse: plain threads start empty, and you opt in.</p>
+  </div>
+</section>
+
+<section id="dotnet" aria-labelledby="dotnet-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-net">AsyncLocal&lt;T&gt;</span></div>
+    <h2 id="dotnet-h">Coming from AsyncLocal&lt;T&gt;</h2>
+  </div>
+  <div class="prose"><p>The model maps almost one to one. The rows marked
+    <span class="chip c-err">differs</span> are where C# instincts
+    mislead.</p></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Aspect</th><th>Python</th><th>.NET</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>Per-flow variable</td><td><code>ContextVar[T]</code></td><td><code>AsyncLocal&lt;T&gt;</code></td><td><span class="chip c-same">same idea</span></td></tr>
+      <tr><td>The container</td><td><code>Context</code></td><td><code>ExecutionContext</code></td><td><span class="chip c-same">same idea</span></td></tr>
+      <tr><td>Snapshot, run inside</td><td><code>copy_context()</code>, <code>ctx.run(fn)</code></td><td><code>ExecutionContext.Capture()</code>, <code>.Run(...)</code></td><td><span class="chip c-same">same idea</span></td></tr>
+      <tr><td>Storage</td><td>immutable map, replaced on write</td><td>immutable map, replaced on write</td><td><span class="chip c-same">same idea</span></td></tr>
+      <tr><td>New task</td><td><code>create_task()</code> copies</td><td><code>Task.Run()</code> flows a copy</td><td><span class="chip c-same">same idea</span></td></tr>
+      <tr><td>Awaited call's writes reach the caller</td><td>yes</td><td>no, undone on return</td><td><span class="chip c-err">differs</span></td></tr>
+      <tr><td>New thread</td><td>starts empty</td><td>flows the context</td><td><span class="chip c-err">differs</span></td></tr>
+      <tr><td>Thread pool</td><td><code>run_in_executor</code> doesn't copy; <code>to_thread</code> does</td><td><code>QueueUserWorkItem</code> flows</td><td><span class="chip c-err">differs</span></td></tr>
+      <tr><td>Unset value</td><td>default, or <code>LookupError</code></td><td><code>default(T)</code></td><td><span class="chip c-err">differs</span></td></tr>
+      <tr><td>Restore helper</td><td><code>Token</code> + <code>reset()</code>; <code>with</code> in 3.14</td><td>none, write a disposable scope</td><td><span class="chip c-only">Python only</span></td></tr>
+      <tr><td>Change callback</td><td>none</td><td><code>new AsyncLocal&lt;T&gt;(args =&gt; ...)</code></td><td><span class="chip c-only">.NET only</span></td></tr>
+      <tr><td>Per thread instead</td><td><code>threading.local()</code></td><td><code>[ThreadStatic]</code>, <code>ThreadLocal&lt;T&gt;</code></td><td><span class="chip c-same">same idea</span></td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>C# / .NET</b>
+    <p>The last row is the trap from the first section. Per-thread
+      storage fails in async code in both languages, because many tasks
+      share one thread. Python's case is starker: asyncio puts every
+      Task on the same thread.</p>
+  </div>
+</section>
+
+<section id="fastapi" aria-labelledby="fastapi-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">request id in logs</span>
+      <span>checked against FastAPI 0.162.4 · Starlette 1.10.0</span></div>
+    <h2 id="fastapi-h">A request id in every log line</h2>
+  </div>
+  <div class="prose">
+    <p>The everyday use: set an id once in middleware, then read it
+      anywhere below, including inside a logging filter, without adding
+      a parameter to every function. This code is not part of this
+      project, but it was run as shown.</p>
+  </div>
+<pre class="code" data-lang="py">request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -&gt; bool:
+        record.request_id = request_id.get()  # read it, no parameter needed
+        return True
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    incoming = request.headers.get("x-request-id") or uuid4().hex[:8]
+    token = request_id.set(incoming)
+    try:
+        response = await call_next(request)
+        response.headers["x-request-id"] = incoming
+        return response
+    finally:
+        request_id.reset(token)</pre>
+  <div class="flow-wrap">
+    <div class="flow" role="img" aria-label="The request header sets the value in middleware, it is copied into the endpoint, and the logging filter reads it">
+      <div class="fbox"><span class="ttl">request</span><span>x-request-id: req-7</span></div>
+      <div class="fbox h-A"><span class="ttl">middleware</span><span>request_id.set("req-7")</span><span class="pill">"req-7"</span></div>
+      <div class="fbox h-A"><span class="ttl">endpoint</span><span>logger.info("loading orders")</span><span class="tag">child task: a copy</span></div>
+      <div class="fbox h-A"><span class="ttl">RequestIdFilter</span><span>request_id.get()</span><span class="pill">"req-7"</span></div>
+    </div>
+    <div class="flow-back">&#9664; endpoint calls request_id.set("changed") &#8594; after call_next() the middleware still reads "req-7"</div>
+  </div>
+  <div class="term" aria-label="Log output">
+    <div class="line l-dim">%(request_id)s | %(message)s</div>
+    <div class="line">req-7 | loading orders</div>
+    <div class="line">req-8 | sync endpoint in a worker thread</div>
+  </div>
+  <div class="prose">
+    <p>Two copies make it work. Starlette runs the rest of the app as a
+      child task of the middleware, and anyio runs <code>def</code>
+      endpoints in a worker thread with a copy of the context. Both
+      copy down, so neither can push a value back up.</p>
+  </div>
+  <div class="note"><b>C# / .NET</b>
+    <p>Same job as <code>logger.BeginScope(...)</code> in ASP.NET Core
+      middleware: every log line inside the scope picks up the id. The
+      default scope provider and <code>IHttpContextAccessor</code> are
+      both built on <code>AsyncLocal&lt;T&gt;</code>.</p>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>You'll also meet it in</th><th>What it keeps per task</th></tr></thead>
+    <tbody>
+      <tr><td><code>decimal.localcontext()</code></td><td>precision and rounding for <code>Decimal</code> math</td></tr>
+      <tr><td><code>structlog.contextvars</code></td><td>log fields bound with <code>bind_contextvars()</code></td></tr>
+      <tr><td>OpenTelemetry</td><td>the current span, so child spans find their parent</td></tr>
+      <tr><td><code>asgi-correlation-id</code></td><td>a ready-made version of the middleware above</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="testing" aria-labelledby="testing-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">pytest</span>
+      <span>test_context_vars_demo.py</span></div>
+    <h2 id="testing-h">How the tests pin it down</h2>
+  </div>
+  <div class="prose">
+    <p>Each test builds the scenario coroutine, then runs it with
+      <code>asyncio.run()</code>. That call creates a fresh event loop,
+      and its main Task runs on a copy of the test thread's context.
+      Whatever a test sets stays inside that copy, so one test can't
+      leak a value into the next.</p>
+  </div>
+<pre class="code" data-lang="py">def test_child_task_change_does_not_reach_parent():
+    # Arrange
+    scenario = parent_starts_child_task()
+
+    # Act
+    _, parent_sees = asyncio.run(scenario)
+
+    # Assert
+    assert parent_sees == "parent"</pre>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Test</th><th>Runs</th><th>Asserts</th></tr></thead>
+    <tbody>
+      <tr><td class="wrap"><code>test_global_is_overwritten_by_concurrent_tasks</code></td><td><code>handle_with_global</code> &#215; 3</td><td><code>["C", "C", "C"]</code></td></tr>
+      <tr><td class="wrap"><code>test_context_var_keeps_each_tasks_own_value</code></td><td><code>handle_with_context_var</code> &#215; 3</td><td><code>["A", "B", "C"]</code></td></tr>
+      <tr><td class="wrap"><code>test_child_task_starts_with_copy_of_parent_value</code></td><td><code>parent_starts_child_task</code></td><td>child saw <code>"parent"</code></td></tr>
+      <tr><td class="wrap"><code>test_child_task_change_does_not_reach_parent</code></td><td><code>parent_starts_child_task</code></td><td>parent still sees <code>"parent"</code></td></tr>
+      <tr><td class="wrap"><code>test_directly_awaited_coroutine_shares_parent_context</code></td><td><code>parent_awaits_coroutine</code></td><td>parent sees <code>"changed-by-child"</code></td></tr>
+    </tbody>
+  </table></div>
+  <div class="note"><b>C# / .NET</b>
+    <p><code>asyncio.run()</code> is the sync-to-async bridge, a bit like
+      <code>.GetAwaiter().GetResult()</code>, except it also creates and
+      closes a whole event loop each time.</p>
+  </div>
+</section>
+
+<section id="gotchas" aria-labelledby="gotchas-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-err">gotchas</span></div>
+    <h2 id="gotchas-h">Six ways to get it wrong</h2>
+  </div>
+  <div class="gotchas">
+    <div class="gotcha">
+      <h3>A mutable value leaks up</h3>
+      <p>A Task copies the context, not the objects in it. Mutate a
+        list and the parent sees the change.</p>
+<pre class="code" data-lang="py">log.set([])
+await asyncio.create_task(child())  # child appends "x"
+log.get()                           # ['x']</pre>
+      <p>Store immutable values (str, tuple, frozen dataclass) and
+        <code>set()</code> a new one. Same with
+        <code>default=[]</code>: every Task that never set a value shares
+        that one list.</p>
+    </div>
+    <div class="gotcha">
+      <h3>A new ContextVar per call</h3>
+      <p>The name is only a label. Identity is the object, so a var
+        built inside a function is a new, unrelated key every time.</p>
+<pre class="code" data-lang="py">def get_id():
+    return ContextVar("request_id").get("missing")  # always "missing"</pre>
+      <p>Create each one once, at module level.</p>
+    </div>
+    <div class="gotcha">
+      <h3>No default means LookupError</h3>
+      <p><code>get()</code> on a var with no value and no default
+        raises. Pass a default to the constructor or to
+        <code>get()</code>.</p>
+      <div class="errmsg">LookupError: &lt;ContextVar name='user_id' at 0x...&gt;</div>
+    </div>
+    <div class="gotcha">
+      <h3>Pool threads remember</h3>
+      <p>A <code>set()</code> inside <code>run_in_executor</code> without
+        <code>ctx.run</code> writes into the pool thread's own context.
+        The next job on that thread reads it.</p>
+<pre class="code" data-lang="py">pool.submit(request_id.set, "leaked").result()
+pool.submit(request_id.get).result()  # 'leaked'</pre>
+    </div>
+    <div class="gotcha">
+      <h3>Expecting await to isolate</h3>
+      <p>A bare <code>await helper()</code> shares your context, so
+        <code>helper</code>'s <code>set()</code> stays after it returns.
+        Use <code>create_task</code> when the helper must not change
+        your values.</p>
+    </div>
+    <div class="gotcha">
+      <h3>Generators share the caller's context</h3>
+      <p>A generator has no context of its own. A <code>set()</code> in
+        its body changes the context of whoever calls
+        <code>next()</code>. PEP 568 proposed otherwise and was
+        deferred.</p>
+    </div>
+  </div>
+</section>
+
+<section id="files" aria-labelledby="files-h">
+  <div class="sec-head">
+    <div class="eyebrow"><span class="chip c-ink">project files</span>
+      <span>read in this order</span></div>
+    <h2 id="files-h">Where each idea lives in the project</h2>
+  </div>
+  <ol class="files">
+    <li><span class="fname">context_vars_demo.py</span>
+      <p>The three behaviours: global vs ContextVar under
+        <code>gather()</code>, a child Task, and a directly awaited
+        child.</p>
+      <div class="cmd"><code>python context_vars_demo.py</code><button class="btn copy" type="button">Copy</button></div></li>
+    <li><span class="fname">test_context_vars_demo.py</span>
+      <p>Five tests, one per behaviour. Install pytest from
+        <code>requirements.txt</code> first.</p>
+      <div class="cmd"><code>pytest -q</code><button class="btn copy" type="button">Copy</button></div></li>
+    <li><span class="fname">learn/index.html</span>
+      <p>ContextVar Field Notes: seven short interactive notes and a
+        predict-the-output quiz.</p>
+      <div class="cmd"><code>open learn/index.html</code><button class="btn copy" type="button">Copy</button></div></li>
+  </ol>
+</section>
+
+<footer class="colophon">Built from this project's code and checked
+  against Python 3.12.4 (3.14.2 for the 3.14-only rows), FastAPI 0.162.4,
+  Starlette 1.10.0 and anyio 4.16.0.</footer>
+</main>
+</div>
+<script>
+(function () {
+  "use strict";
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- tiny syntax highlighter ---------- */
+  var KW = {
+    py: ["async", "await", "def", "return", "class", "import", "from", "try",
+      "finally", "with", "as", "global", "if", "else", "for", "in", "not",
+      "None", "True", "False", "yield", "raise", "except", "or", "and"],
+    cs: ["static", "readonly", "new", "using", "var", "await", "async",
+      "return", "public", "private", "string", "class"]
+  };
+  function esc(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  function hl(src, lang) {
+    var words = KW[lang] || KW.py;
+    var comment = lang === "cs" ? "//[^\\n]*" : "#[^\\n]*";
+    var re = new RegExp(
+      "(" + comment + ")" +
+      "|(\"(?:[^\"\\\\\\n]|\\\\.)*\"|'(?:[^'\\\\\\n]|\\\\.)*')" +
+      "|(@[A-Za-z_][\\w.]*)" +
+      "|\\b(" + words.join("|") + ")\\b", "g");
+    var out = "", last = 0, m;
+    while ((m = re.exec(src)) !== null) {
+      out += esc(src.slice(last, m.index));
+      var tok = esc(m[0]);
+      var cls = m[1] ? "tk-c" : m[2] ? "tk-s" : m[3] ? "tk-d" : "tk-k";
+      out += '<span class="' + cls + '">' + tok + "</span>";
+      last = re.lastIndex;
+    }
+    return out + esc(src.slice(last));
+  }
+  document.querySelectorAll("pre.code[data-lang]").forEach(function (pre) {
+    pre.innerHTML = hl(pre.textContent, pre.dataset.lang);
+  });
+
+  /* ---------- rail: mark the section in view ---------- */
+  var links = Array.prototype.slice.call(document.querySelectorAll("#rail-list a"));
+  var byId = {};
+  links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+  if ("IntersectionObserver" in window) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        links.forEach(function (a) { a.classList.remove("active"); });
+        var link = byId[e.target.id];
+        if (link) link.classList.add("active");
+      });
+    }, { rootMargin: "-25% 0px -65% 0px" });
+    Object.keys(byId).forEach(function (id) {
+      var sec = document.getElementById(id);
+      if (sec) io.observe(sec);
+    });
+  }
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll(".cmd .copy").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var code = btn.previousElementSibling;
+      var text = code.textContent;
+      function selectIt() {
+        var range = document.createRange();
+        range.selectNodeContents(code);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        btn.textContent = "Selected";
+      }
+      try {
+        navigator.clipboard.writeText(text).then(function () {
+          btn.textContent = "Copied";
+        }, selectIt);
+      } catch (err) {
+        selectIt();
+      }
+      setTimeout(function () { btn.textContent = "Copy"; }, 1600);
+    });
+  });
+
+  /* ---------- model: which context is current ---------- */
+  var MODEL = {
+    A: { r1: '"A"', r2: "41", w2: "Found in the current context." },
+    B: { r1: '"B"', r2: "7", w2: "Found in the current context." },
+    C: { r1: '"C"', r2: "None",
+      w2: "Not in Task C's context, so get() returns the default you passed." }
+  };
+  function setModel(task) {
+    var info = MODEL[task];
+    document.querySelectorAll("#model-fig .mcard").forEach(function (card) {
+      card.classList.toggle("on", card.dataset.task === task);
+    });
+    var ptr = document.getElementById("m-ptr");
+    ptr.className = "pill h-" + task;
+    ptr.textContent = "Task " + task + "'s context";
+    var r1 = document.getElementById("m-r1");
+    r1.className = "pill h-" + task;
+    r1.textContent = info.r1;
+    var r2 = document.getElementById("m-r2");
+    r2.className = task === "C" ? "pill h-0" : "pill h-" + task;
+    r2.textContent = info.r2;
+    document.getElementById("m-w2").textContent = info.w2;
+  }
+  document.querySelectorAll('input[name="model-task"]').forEach(function (input) {
+    input.addEventListener("change", function () { setModel(input.value); });
+  });
+  setModel("A");
+
+  /* ---------- shared stepper: back / step / run all ---------- */
+  function makeStepper(opts) {
+    var state = { step: 0, timer: null };
+    var back = document.getElementById(opts.back);
+    var stepBtn = document.getElementById(opts.step);
+    var run = document.getElementById(opts.run);
+    function stop() {
+      if (state.timer) { clearInterval(state.timer); state.timer = null; }
+      run.textContent = "Run all";
+    }
+    function go(n) {
+      state.step = Math.max(0, Math.min(opts.max, n));
+      back.disabled = state.step === 0;
+      stepBtn.disabled = state.step === opts.max;
+      opts.render(state.step);
+    }
+    back.addEventListener("click", function () { stop(); go(state.step - 1); });
+    stepBtn.addEventListener("click", function () { stop(); go(state.step + 1); });
+    run.addEventListener("click", function () {
+      if (state.timer) { stop(); return; }
+      if (state.step === opts.max) go(0);
+      if (reduceMotion) { go(opts.max); return; }
+      run.textContent = "Pause";
+      state.timer = setInterval(function () {
+        go(state.step + 1);
+        if (state.step === opts.max) stop();
+      }, 900);
+    });
+    return { go: go, current: function () { return state.step; } };
+  }
+
+  /* ---------- race: global vs ContextVar under gather() ---------- */
+  var TASKS = ["A", "B", "C"];
+  var EVENTS = [["A", "set"], ["A", "await"], ["B", "set"], ["B", "await"],
+    ["C", "set"], ["C", "await"], ["A", "get"], ["B", "get"], ["C", "get"]];
+  var RACE_CODE = {
+    global: { set: function (t) { return 'global_request_id = "' + t + '"'; },
+      get: "return global_request_id" },
+    cv: { set: function (t) { return 'request_id.set("' + t + '")'; },
+      get: "return request_id.get()" }
+  };
+  var SAME = null;
+  var RACE_TEXT = {
+    global: [
+      SAME,
+      'Task A stores <code>"A"</code> in the module global.',
+      SAME,
+      'B writes <code>"B"</code> into the same global. A\'s value is gone, and A can\'t tell.',
+      SAME,
+      'C overwrites the global with <code>"C"</code>. Last writer wins.',
+      SAME,
+      'A resumes and reads the global: <code>"C"</code>. It stored <code>"A"</code>. This is the bug.',
+      'B resumes and reads <code>"C"</code> as well.',
+      'C reads <code>"C"</code>, right only by luck. <code>test_global_is_overwritten_by_concurrent_tasks</code> asserts <code>["C", "C", "C"]</code>.'
+    ],
+    cv: [
+      SAME,
+      'Task A calls <code>request_id.set("A")</code>. The write lands in Task A\'s own context.',
+      SAME,
+      'B writes <code>"B"</code> into Task B\'s context. A\'s context still holds <code>"A"</code>.',
+      SAME,
+      'C writes <code>"C"</code> into its own context. Three Tasks, three values.',
+      SAME,
+      'Before resuming A, the loop makes A\'s context current again, so <code>request_id.get()</code> returns <code>"A"</code>.',
+      'B resumes in B\'s context and reads <code>"B"</code>.',
+      'Every Task got its own value back. <code>test_context_var_keeps_each_tasks_own_value</code> asserts <code>["A", "B", "C"]</code>.'
+    ],
+    both: [
+      '<code>asyncio.gather()</code> wraps each handler in a Task and queues A, B and C. One thread will run all three, one at a time.',
+      "", 'A reaches <code>await asyncio.sleep(0.01)</code>. The loop suspends A and runs the next ready Task, B.',
+      "", 'B suspends at its <code>await</code>. The loop moves on to C.',
+      "", 'All three are waiting on their timers. The thread has nothing to run until the first one fires.',
+      "", "", ""
+    ]
+  };
+  var RACE_NET = {
+    global: ['&#8776; <code>Task.WhenAll(Handle("A"), Handle("B"), Handle("C"))</code>, with every continuation on one thread.',
+      'A module global is like a <code>static</code> field: one slot for the whole process.',
+      'Same as <code>await</code> in C#: the method gives the thread back. Here the thread goes straight to B.',
+      "", "", "", "",
+      '<code>[ThreadStatic]</code> wouldn\'t fix it: all three Tasks share one thread.', "", ""],
+    cv: ['&#8776; <code>Task.WhenAll(Handle("A"), Handle("B"), Handle("C"))</code>, with every continuation on one thread.',
+      '&#8776; <code>RequestId.Value = "A"</code> on an <code>AsyncLocal&lt;string&gt;</code>.',
+      'Same as <code>await</code> in C#: the method gives the thread back. Here the thread goes straight to B.',
+      "", "", "", "",
+      'C# does the same when a continuation runs: it restores the captured <code>ExecutionContext</code>.', "", ""]
+  };
+
+  function raceMode() {
+    return document.getElementById("race-cv").checked ? "cv" : "global";
+  }
+  function globalBefore(index) {
+    var val = null;
+    for (var i = 0; i < index; i++) {
+      if (EVENTS[i][1] === "set") val = EVENTS[i][0];
+    }
+    return val;
+  }
+  function renderRace(k) {
+    var mode = raceMode();
+    var code = RACE_CODE[mode];
+    var cur = k > 0 ? EVENTS[k - 1] : null;
+    function doneAt(t, op) {
+      for (var i = 0; i < k; i++) {
+        if (EVENTS[i][0] === t && EVENTS[i][1] === op) return i;
+      }
+      return -1;
+    }
+    function curCls(t, op) {
+      return cur && cur[0] === t && cur[1] === op ? " cur" : "";
+    }
+    var results = TASKS.map(function (t) {
+      var at = doneAt(t, "get");
+      if (at < 0) return null;
+      return mode === "cv" ? t : globalBefore(at);
+    });
+
+    var html = '<div class="lane head"><span></span><span>1 &#183; store the id</span>' +
+      "<span>2 &#183; fake I/O</span><span>3 &#183; read it back</span></div>";
+    TASKS.forEach(function (t, i) {
+      var setDone = doneAt(t, "set") >= 0;
+      var awaitDone = doneAt(t, "await") >= 0;
+      var getDone = results[i] !== null;
+      var awaitCls = getDone ? " done" : awaitDone ? " wait" : "";
+      var awaitSub = getDone ? "resumed" : awaitDone ? "suspended" : "";
+      var res = "";
+      if (getDone) {
+        var ok = results[i] === t;
+        res = '<span class="res ' + (ok ? "ok" : "bad") + '">&#8594; "' +
+          results[i] + '"' + (ok ? "" : " &#10005;") + "</span>";
+      }
+      html += '<div class="lane h-' + t + '"><span class="lane-lab"><b>Task ' + t +
+        '</b>handle("' + t + '")</span>' +
+        '<div class="cell' + (setDone ? " done" : "") + curCls(t, "set") + '"><code>' +
+        esc(code.set(t)) + "</code></div>" +
+        '<div class="cell' + awaitCls + curCls(t, "await") +
+        '"><code>await asyncio.sleep(0.01)</code><span class="sub">' + awaitSub + "</span></div>" +
+        '<div class="cell' + (getDone ? " done" : "") + curCls(t, "get") + '"><code>' +
+        esc(code.get) + "</code>" + res + "</div></div>";
+    });
+    document.getElementById("race-lanes").innerHTML = html;
+
+    var store = '<p class="store-h">Where the value lives</p>';
+    if (mode === "global") {
+      var sets = [];
+      for (var i = 0; i < k; i++) if (EVENTS[i][1] === "set") sets.push(EVENTS[i][0]);
+      var val = sets.length ? sets[sets.length - 1] : null;
+      var hist = sets.map(function (t, j) {
+        return j < sets.length - 1 ? '<s>"' + t + '"</s>' : '"' + t + '"';
+      }).join(" &#8594; ");
+      store += '<div class="slot"><span class="slot-name">global_request_id</span>' +
+        (val ? '<span class="pill h-' + val + '">"' + val + '"</span>'
+             : '<span class="pill unset">"none" (initial value)</span>') +
+        '<span class="hist">writes: ' + (hist || "none yet") + "</span></div>" +
+        '<span class="sub">One slot for the whole process. Every Task reads and writes the same one.</span>';
+    } else {
+      TASKS.forEach(function (t) {
+        var isSet = doneAt(t, "set") >= 0;
+        store += '<div class="ctxcard h-' + t + '"><span class="ttl">Task ' + t +
+          "'s context</span><span class=\"k\">request_id</span><span>&#8594;</span>" +
+          (isSet ? '<span class="pill">"' + t + '"</span>'
+                 : '<span class="pill unset">not set, get() gives "none"</span>') + "</div>";
+      });
+      store += '<span class="sub">One context per Task. The loop makes the right one current each time it resumes a Task.</span>';
+    }
+    document.getElementById("race-store").innerHTML = store;
+
+    var text = RACE_TEXT[mode][k] || RACE_TEXT.both[k];
+    document.getElementById("race-n").textContent = k + " / " + EVENTS.length;
+    document.getElementById("race-text").innerHTML = text;
+    document.getElementById("race-net").innerHTML = RACE_NET[mode][k] || "";
+
+    var label = mode === "cv" ? "   ContextVar : " : "   global     : ";
+    var got = results.map(function (r) { return r ? "'" + r + "'" : "…"; }).join(", ");
+    var complete = results.every(function (r) { return r !== null; });
+    var cls = complete ? (mode === "cv" ? " l-ok" : " l-err") : "";
+    document.getElementById("race-term").innerHTML =
+      '<div class="line l-dim">$ python context_vars_demo.py</div>' +
+      '<div class="line l-dim">1. Three concurrent tasks each set their own request id</div>' +
+      '<div class="line fresh' + cls + '">' + esc(label + "sent ['A', 'B', 'C'] -> got [" + got + "]") + "</div>";
+  }
+  var race = makeStepper({ back: "race-back", step: "race-step", run: "race-run",
+    max: EVENTS.length, render: renderRace });
+  document.querySelectorAll('input[name="race-mode"]').forEach(function (input) {
+    input.addEventListener("change", function () { race.go(race.current()); });
+  });
+  race.go(0);
+
+  /* ---------- inherit: create_task copies, await shares ---------- */
+  var P = ["parent", "A"];
+  var CHG = ["changed-by-child", "B"];
+  var INH = {
+    task: {
+      head: "Parent · parent_starts_child_task",
+      title: "2. Parent starts a child Task, child changes the value",
+      lines: ['request_id.set("parent")',
+        "child_task = asyncio.create_task(child_changes_value())",
+        "child_saw = await child_task",
+        "parent_sees = request_id.get()"],
+      steps: [
+        { p: -1, c: -1, parent: null, child: null, seen: null },
+        { p: 0, c: -1, parent: P, child: null, seen: null },
+        { p: 1, c: -1, parent: P, child: P, seen: null },
+        { p: 2, c: 0, parent: P, child: P, seen: P },
+        { p: 2, c: 1, parent: P, child: CHG, seen: P },
+        { p: 3, c: -1, parent: P, child: CHG, seen: P }
+      ],
+      text: [
+        'Press Step. Both versions run the same child, <code>child_changes_value()</code>.',
+        'The parent sets <code>"parent"</code> in its own context.',
+        '<code>create_task()</code> snapshots the parent\'s context with <code>copy_context()</code> and gives the copy to the new Task.',
+        'The parent waits on the Task. The child reads <code>request_id</code> and sees <code>"parent"</code>. Values copy down.',
+        'The child writes <code>"changed-by-child"</code>. The write goes into the child\'s copy only.',
+        'The parent reads <code>"parent"</code>. The child\'s write never came back up. That\'s <code>test_child_task_change_does_not_reach_parent</code>.'
+      ],
+      net: ["", "",
+        '&#8776; <code>Task.Run(...)</code>: the <code>ExecutionContext</code> flows into the new task as a snapshot.',
+        "", "", ""],
+      result: "   child saw 'parent', parent still sees 'parent'  (copied down, never up)"
+    },
+    await: {
+      head: "Parent · parent_awaits_coroutine",
+      title: "3. Parent awaits the child coroutine directly (no new Task)",
+      lines: ['request_id.set("parent")',
+        "await child_changes_value()",
+        "parent_sees = request_id.get()"],
+      steps: [
+        { p: -1, c: -1, parent: null, seen: null, inside: false },
+        { p: 0, c: -1, parent: P, seen: null, inside: false },
+        { p: 1, c: -1, parent: P, seen: null, inside: true },
+        { p: 1, c: 0, parent: P, seen: P, inside: true },
+        { p: 1, c: 1, parent: CHG, seen: P, inside: true },
+        { p: 2, c: -1, parent: CHG, seen: P, inside: false }
+      ],
+      text: [
+        'Press Step. Both versions run the same child, <code>child_changes_value()</code>.',
+        'The parent sets <code>"parent"</code> in its own context.',
+        '<code>await child_changes_value()</code> is a plain call. No Task starts, so nothing is copied. The child runs in the parent\'s context.',
+        'The child reads <code>"parent"</code>, the same as before.',
+        'The child writes <code>"changed-by-child"</code> into the one shared context.',
+        'The parent reads <code>"changed-by-child"</code>. That\'s <code>test_directly_awaited_coroutine_shares_parent_context</code>.'
+      ],
+      net: ["", "",
+        '&#9888; In C#, the awaited async method would get its own copy-on-write context here.',
+        "", "",
+        'In C#, the parent would still read <code>"parent"</code> here.'],
+      result: "   parent now sees 'changed-by-child'  (same context)"
+    }
+  };
+  var CHILD_LINES = ["seen = request_id.get()", 'request_id.set("changed-by-child")', "return seen"];
+
+  function inhMode() {
+    return document.getElementById("inh-await").checked ? "await" : "task";
+  }
+  function linesHtml(lines, curIdx) {
+    return lines.map(function (line, i) {
+      return '<div class="ln' + (i === curIdx ? " cur" : "") +
+        '"><span class="arrow">&#9654;</span><span class="src">' + hl(line, "py") + "</span></div>";
+    }).join("");
+  }
+  function valPill(v) {
+    if (!v) return '<span class="pill unset">not set</span>';
+    return '<span class="pill h-' + v[1] + '">"' + v[0] + '"</span>';
+  }
+  function renderInh(k) {
+    var mode = inhMode();
+    var d = INH[mode];
+    var s = d.steps[k];
+    document.getElementById("inh-phead").textContent = d.head;
+    document.getElementById("inh-parent").innerHTML = linesHtml(d.lines, s.p);
+    document.getElementById("inh-child").innerHTML = linesHtml(CHILD_LINES, s.c);
+
+    var seen = '<div class="row"><span class="k">seen</span>' +
+      (s.seen ? valPill(s.seen) : '<span class="pill unset">not read yet</span>') + "</div>";
+    var html = '<div class="ctxbox h-A"><span class="ttl">Parent Task &#183; context</span>' +
+      '<div class="row"><span class="k">request_id</span>' + valPill(s.parent) + "</div>";
+    if (mode === "await") {
+      var started = k >= 2;
+      html += '<div class="ctxbox nested h-B' + (started ? "" : " ghost") +
+        '"><span class="ttl">child coroutine &#183; no Task, no context of its own</span>' +
+        seen + "</div></div>";
+    } else {
+      var exists = s.child !== null;
+      html += "</div>" +
+        '<div class="copy-arrow' + (exists ? "" : " ghost") + '">&#9660; copy_context(), done by create_task()</div>' +
+        '<div class="ctxbox h-B' + (exists ? "" : " ghost") +
+        '"><span class="ttl">Child Task &#183; context (a copy)</span>' +
+        '<div class="row"><span class="k">request_id</span>' + valPill(s.child) + "</div>" + seen + "</div>";
+    }
+    document.getElementById("inh-ctx").innerHTML = html;
+
+    document.getElementById("inh-n").textContent = k + " / 5";
+    document.getElementById("inh-text").innerHTML = d.text[k];
+    document.getElementById("inh-net").innerHTML = d.net[k];
+    var term = '<div class="line l-dim">$ python context_vars_demo.py</div>' +
+      '<div class="line l-dim">' + esc(d.title) + "</div>";
+    if (k === 5) {
+      term += '<div class="line fresh ' + (mode === "task" ? "l-ok" : "l-err") + '">' + esc(d.result) + "</div>";
+    }
+    document.getElementById("inh-term").innerHTML = term;
+  }
+  var inh = makeStepper({ back: "inh-back", step: "inh-step", run: "inh-run",
+    max: 5, render: renderInh });
+  document.querySelectorAll('input[name="inh-mode"]').forEach(function (input) {
+    input.addEventListener("change", function () { inh.go(inh.current()); });
+  });
+  inh.go(0);
+})();
+</script>
+</body>
+</html>
